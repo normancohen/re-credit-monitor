@@ -1,13 +1,10 @@
 name: Refresh market data
-
 on:
   schedule:
-    - cron: "17 11 * * 1-5"   # weekdays ~7:17am New York (11:17 UTC)
-  workflow_dispatch:           # adds a "Run workflow" button for on-demand refresh
-
+    - cron: "17 11 * * 1-5"   # weekdays ~7:17am New York
+  workflow_dispatch:           # "Run workflow" button
 permissions:
   contents: write
-
 jobs:
   refresh:
     runs-on: ubuntu-latest
@@ -17,171 +14,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Pull public data (FRED, Yahoo, SEC, Zillow)
-        run: |
-          mkdir -p data
-          cat > /tmp/refresh.py <<'PYEOF'
-          #!/usr/bin/env python3
-          """RE Credit Monitor - data refresh.
-
-          Pulls free public series and writes data/market.json next to this script's parent folder.
-          Every series records its source and URL so the app can cite it. Failures are logged, never fatal.
-          Run:  python3 pipeline/refresh.py   (from the artifact root)
-          """
-          import csv, io, json, sys, time, datetime as dt, urllib.request, urllib.error, os
-
-          UA = {"User-Agent": "Mozilla/5.0 (RE Credit Monitor research; ncohen@asg-capital.com)"}
-          OUT = os.path.join(os.getcwd(), "data", "market.json")
-          TODAY = dt.date.today()
-          errors, series = [], {}
-
-          def get(url, tries=2):
-              for i in range(tries):
-                  try:
-                      req = urllib.request.Request(url, headers=UA)
-                      with urllib.request.urlopen(req, timeout=25) as r:
-                          return r.read().decode("utf-8", "replace")
-                  except Exception as e:
-                      last = e; time.sleep(2 * (i + 1))
-              raise last
-
-          def thin(obs, freq):
-              """Keep daily points for the last 5 years, month-end points before that."""
-              if freq != "D":
-                  return obs
-              cut = (TODAY - dt.timedelta(days=5 * 365)).isoformat()
-              old, new, last_month = [], [], None
-              for d, v in obs:
-                  if d >= cut:
-                      new.append([d, v])
-                  else:
-                      m = d[:7]
-                      if old and old[-1][0][:7] == m:
-                          old[-1] = [d, v]
-                      else:
-                          old.append([d, v])
-              return old + new
-
-          # ---------- FRED (no key needed: fredgraph.csv) ----------
-          FRED = {
-            # rates
-            "DFF": ("Effective fed funds rate", "D", "rates"),
-            "DFEDTARU": ("Fed funds target, upper", "D", "rates"),
-            "DFEDTARL": ("Fed funds target, lower", "D", "rates"),
-            "SOFR": ("SOFR", "D", "rates"),
-            "SOFR30DAYAVG": ("SOFR 30-day average", "D", "rates"),
-            "DPRIME": ("Bank prime rate", "D", "rates"),
-            "DGS3MO": ("3M Treasury", "D", "rates"),
-            "DGS1": ("1Y Treasury", "D", "rates"),
-            "DGS2": ("2Y Treasury", "D", "rates"),
-            "DGS5": ("5Y Treasury", "D", "rates"),
-            "DGS7": ("7Y Treasury", "D", "rates"),
-            "DGS10": ("10Y Treasury", "D", "rates"),
-            "DGS30": ("30Y Treasury", "D", "rates"),
-            "T10Y2Y": ("10Y minus 2Y", "D", "rates"),
-            "DFII10": ("10Y TIPS real yield", "D", "rates"),
-            "T10YIE": ("10Y breakeven inflation", "D", "rates"),
-            "MORTGAGE30US": ("30Y fixed mortgage rate", "W", "rates"),
-            # credit spreads
-            "BAMLC0A0CM": ("IG corporate OAS", "D", "credit"),
-            "BAMLC0A4CBBB": ("BBB corporate OAS", "D", "credit"),
-            "BAMLH0A0HYM2": ("High-yield OAS", "D", "credit"),
-            # bank CRE lending and credit quality
-            "CREACBW027SBOG": ("CRE loans, all commercial banks", "W", "credit"),
-            "DRCRELEXFACBS": ("CRE delinquency rate excl. farmland, all banks", "Q", "credit"),
-            "SUBLPDRCSC": ("SLOOS: net % tightening, construction & land dev", "Q", "credit"),
-            "SUBLPDRCSM": ("SLOOS: net % tightening, multifamily", "Q", "credit"),
-            "SUBLPDRCSN": ("SLOOS: net % tightening, nonfarm nonresidential", "Q", "credit"),
-            "SUBLPDRCDC": ("SLOOS: net % stronger demand, construction & land dev", "Q", "credit"),
-            "SUBLPDRCDM": ("SLOOS: net % stronger demand, multifamily", "Q", "credit"),
-            # space cycle, national multifamily
-            "RRVRUSQ156N": ("US rental vacancy rate", "Q", "space"),
-            "HOUST5F": ("Housing starts, 5+ units (SAAR, thous.)", "M", "space"),
-            "PERMIT5": ("Permits, 5+ units (SAAR, thous.)", "M", "space"),
-            "UNDCON5MUSA": ("Under construction, 5+ units (thous.)", "M", "space"),
-            "COMPU5MUSA": ("Completions, 5+ units (SAAR, thous.)", "M", "space"),
-            "CUSR0000SEHA": ("CPI rent of primary residence, US", "M", "space"),
-            "CPIAUCSL": ("CPI all items, US", "M", "macro"),
-            "CUURA101SEHA": ("CPI rent of primary residence, New York metro", "M", "space"),
-            "CUURS35BSEHA": ("CPI rent of primary residence, Miami metro", "M", "space"),
-            "SMU36356200000000001": ("Nonfarm payrolls, New York MSA (thous.)", "M", "space"),
-            "SMU12331000000000001": ("Nonfarm payrolls, Miami MSA (thous.)", "M", "space"),
-            "PAYEMS": ("Nonfarm payrolls, US (thous.)", "M", "macro"),
-            "UNRATE": ("Unemployment rate, US", "M", "macro"),
-            # prices
-            "COMREPUSQ159N": ("Commercial real estate prices, US (YoY %)", "Q", "pricing"),
-          }
-
-          def fred(sid, start="2000-01-01"):
-              url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}&cosd={start}"
-              txt = get(url)
-              rows = list(csv.reader(io.StringIO(txt)))
-              obs = []
-              for r in rows[1:]:
-                  if len(r) < 2 or r[1] in ("", "."):
-                      continue
-                  try:
-                      obs.append([r[0], round(float(r[1]), 4)])
-                  except ValueError:
-                      pass
-              if not obs:
-                  raise ValueError("no observations")
-              return obs
-
-          for sid, (name, freq, group) in FRED.items():
-              try:
-                  obs = fred(sid)
-                  series[sid] = {"name": name, "freq": freq, "group": group, "source": "FRED, Federal Reserve Bank of St. Louis",
-                                 "url": f"https://fred.stlouisfed.org/series/{sid}", "obs": thin(obs, freq)}
-              except Exception as e:
-                  errors.append(f"FRED {sid}: {e}")
-
-          # ---------- Listed lenders and REITs (Yahoo Finance chart API, monthly + last 2y daily) ----------
-          TICKERS = {"ARI": "Apollo Commercial RE Finance", "BXMT": "Blackstone Mortgage Trust", "LADR": "Ladder Capital",
-                     "KREF": "KKR Real Estate Finance", "TRTX": "TPG RE Finance Trust", "ACR": "ACRES Commercial Realty",
-                     "STWD": "Starwood Property Trust", "REM": "iShares Mortgage Real Estate ETF", "VNQ": "Vanguard Real Estate ETF",
-                     "KRE": "SPDR S&P Regional Banking ETF"}
-          for t, name in TICKERS.items():
-              try:
-                  js = json.loads(get(f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?range=10y&interval=1d"))
-                  r = js["chart"]["result"][0]
-                  ts, cl = r["timestamp"], r["indicators"]["quote"][0]["close"]
-                  obs = [[dt.datetime.utcfromtimestamp(a).date().isoformat(), round(b, 3)] for a, b in zip(ts, cl) if b is not None]
-                  series["PX_" + t] = {"name": f"{name} ({t}) close", "freq": "D", "group": "listed", "source": "Yahoo Finance",
-                                       "url": f"https://finance.yahoo.com/quote/{t}", "obs": thin(obs, "D")}
-              except Exception as e:
-                  errors.append(f"Yahoo {t}: {e}")
-
-          # ---------- Book value per share for the mREITs (SEC XBRL company facts) ----------
-          CIK = {"ARI": "0001467760", "BXMT": "0001061630", "LADR": "0001577670", "KREF": "0001631596", "TRTX": "0001630472",
-                 "ACR": "0001332551", "STWD": "0001465128"}
-          for t, cik in CIK.items():
-              try:
-                  js = json.loads(get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"))
-                  g = js["facts"]["us-gaap"]
-                  eq = g.get("StockholdersEquity", {}).get("units", {}).get("USD", [])
-                  sh = (js["facts"].get("dei", {}).get("EntityCommonStockSharesOutstanding", {}).get("units", {}).get("shares", []))
-                  def latest_by_date(arr, key="end"):
-                      d = {}
-                      for x in arr:
-                          if x.get("form") in ("10-Q", "10-K", "10-Q/A", "10-K/A"):
-                              d[x[key]] = x["val"]
-                      return sorted(d.items())
-                  eqs, shs = latest_by_date(eq), latest_by_date(sh)
-                  bvps = []
-                  for d, v in eqs[-24:]:
-                      s = [sv for sd, sv in shs if sd >= d]
-                      if s:
-                          bvps.append([d, round(v / s[0], 3)])
-                  series["BVPS_" + t] = {"name": f"{t} book value per share (approx: equity / shares)", "freq": "Q", "group": "listed",
-                                         "source": "SEC EDGAR XBRL company facts", "url": f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}",
-                                         "obs": bvps, "note": "Total stockholders' equity includes preferred and non-controlling interests where reported; treat as approximate."}
-              except Exception as e:
-                  errors.append(f"SEC {t}: {e}")
-
-          # ---------- Zillow Observed Rent Index (metro, all homes, smoothed) ----------
-          METROS = ["New York, NY", "Miami, FL", "Tampa, FL", "Orlando, FL", "Atlanta, GA", "Charlotte, NC", "Nashville, TN",
-                    "Dallas, TX", "Houston, TX", "Austin, TX", "Phoenix, AZ", "Chicago, IL", "Los Angeles, CA", "Washington, DC",
-                    "United States"]
-          try:
-              txt = get("https://files.zillowstatic.com/research/public_csvs/zori/Metr
+      - run: python pipeline/refresh.py
+      - run: |
+          git config user.name "re-credit-monitor-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/market.json
+          git diff --cached --quiet || git commit -m "Data refresh $(date -u +%Y-%m-%d)"
+          git push
