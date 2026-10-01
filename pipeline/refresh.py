@@ -50,12 +50,15 @@ COMPU5MUSA|Completions, 5+ units (SAAR, k)|M|space
 CUSR0000SEHA|CPI rent of primary residence, US|M|space
 CPIAUCSL|CPI all items, US|M|macro
 CUURA101SEHA|CPI rent, New York metro|M|space
-CUURS35BSEHA|CPI rent, Miami metro|M|space
-SMU36356200000000001|Payrolls, New York MSA (k)|M|space
-SMU12331000000000001|Payrolls, Miami MSA (k)|M|space
+CUURA320SEHA|CPI rent, Miami metro|M|space
+BAA10Y|Moody's Baa corporate yield minus 10Y|D|credit
+T10Y3M|10Y minus 3M Treasury|D|rates
 PAYEMS|Payrolls, US (k)|M|macro
 UNRATE|Unemployment rate, US|M|macro
 COMREPUSQ159N|Commercial RE prices, US (YoY %)|Q|pricing"""
+METRO={"New York, NY":"NEWY636","Miami, FL":"MIAM112","Tampa, FL":"TAMP312","Orlando, FL":"ORLA712","Atlanta, GA":"ATLA013","Charlotte, NC":"CHAR737","Nashville, TN":"NASH947","Dallas, TX":"DALL148","Houston, TX":"HOUS448","Austin, TX":"AUST448","Phoenix, AZ":"PHOE004","Chicago, IL":"CHIC917","Los Angeles, CA":"LOSA106","Washington, DC":"WASH911"}
+for m,c in METRO.items():
+  FRED+=f"\n{c}NA|Payrolls, {m} metro (k)|M|metro\n{c}BPPRIV|Housing permits, {m} metro (units)|M|metro"
 for line in FRED.splitlines():
   sid,name,freq,grp=line.split("|")
   try:
@@ -80,10 +83,13 @@ def bydate(a):
 for t,c in CIK.items():
   try:
     f=json.loads(get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{c}.json"))["facts"]
-    eq=bydate(f["us-gaap"].get("StockholdersEquity",{}).get("units",{}).get("USD",[]))
+    g=f["us-gaap"]; u=lambda t:g.get(t,{}).get("units",{}).get("USD",[])
+    eq=bydate(u("StockholdersEquity") or u("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"))
+    pf=dict(bydate(u("PreferredStockLiquidationPreferenceValue") or u("PreferredStockValue")))
+    eq=[(d,v-pf.get(d,0)) for d,v in eq]
     sh=bydate(f.get("dei",{}).get("EntityCommonStockSharesOutstanding",{}).get("units",{}).get("shares",[]))
     bv=[[d,round(v/s[0],3)] for d,v in eq[-24:] for s in [[sv for sd,sv in sh if sd>=d]] if s]
-    add("BVPS_"+t,f"{t} book value/share (approx: total equity / shares)","Q","listed","SEC EDGAR XBRL",f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={c}",bv)
+    add("BVPS_"+t,f"{t} book value per common share (equity less preferred, / shares)","Q","listed","SEC EDGAR XBRL",f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={c}",bv)
   except Exception as e: ERR.append(f"SEC {t}: {e}")
 M=["New York, NY","Miami, FL","Tampa, FL","Orlando, FL","Atlanta, GA","Charlotte, NC","Nashville, TN","Dallas, TX","Houston, TX","Austin, TX","Phoenix, AZ","Chicago, IL","Los Angeles, CA","Washington, DC","United States"]
 try:
